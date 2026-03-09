@@ -23,12 +23,70 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import tqdm
 import kagglehub
+import math
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 # Download latest version
 # path = kagglehub.dataset_download("nunenuh/pytorch-challange-flower-dataset")
 
 # print("Path to dataset files:", path)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+def timestep_embedding(timesteps, embed_dim):
+    """
+    timesteps: (B,)
+    returns: (B, dim)
+    
+    """
+    
+    half_dim = embed_dim//2
+    freqs = torch.exp( - math.log(10000) * torch.arange(half_dim, dtype = torch.float32) / half_dim).to(timesteps.device)
+    args = timesteps[:, None].float() * freqs[None]
+    embedding = torch.cat([torch.sin(args), torch.cos(args)], dim = -1)
+    
+    return embedding
+
+class ResBlock(nn.Module):
+    
+    def __init__(self, in_channels, time_emb_dim):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(2,in_channels)
+        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size = 5, padding = 2)
+        
+        self.time_proj = nn.Linear(time_emb_dim, in_channels)
+        
+        self.norm2 = nn.GroupNorm(2, in_channels)
+        self.conv2 = nn.Conv2d(in_channels, in_channels, kernel_size = 5, padding = 2)
+        
+        self.act = nn.SiLU()
+        
+    def forward(self, x, t_emb):
+        
+        h = self.conv1(self.act(self.norm1(x))) #(B,C,H,W)
+        
+        t_proj = self.time_proj(t_emb)
+        
+        h = h + t_proj[:,:,None,None]
+        
+        h = self.conv2(self.act(self.norm2(h)))
+        
+        return x+h
+
+class MidBlock(nn.Module):
+    def __init__(self, channels, time_emb_dim):
+        super().__init__()
+        
+        self.res1 = ResBlock(channels,time_emb_dim)
+        self.res2 = ResBlock(channels,time_emb_dim)
+        
+        self.time_emb_dim = time_emb_dim
+    def forward(self, x, t):
+        t_emb = timestep_embedding(t, self.time_emb_dim)
+        
+        x = self.res1(x,t_emb)
+        x = self.res2(x,t_emb)
+        
+        return x
+        
 class UNet(nn.Module):
     
     def __init__(self,in_channel=3, out_channel=3):
@@ -38,6 +96,9 @@ class UNet(nn.Module):
             nn.Conv2d(32, 64, kernel_size = 5, padding = 2),
             nn.Conv2d(64,64, kernel_size = 5, padding = 2)          
             ])
+        
+        self.mid_layers = MidBlock(64,64)
+        
         self.up_layers = torch.nn.ModuleList([
             nn.Conv2d(64, 64, kernel_size = 5, padding =2),
             nn.Conv2d(64, 32, kernel_size = 5, padding = 2),
@@ -47,13 +108,15 @@ class UNet(nn.Module):
         self.act = nn.SiLU()
         self.downscale = nn.MaxPool2d(2)
         self.upscale = nn.Upsample(scale_factor = 2)
-    def forward(self, x):
+    def forward(self, x,t):
         h = []
         for i, l in enumerate(self.down_layers):
             x = self.act(l(x))
             if i< 2:
                 h.append(x)
                 x = self.downscale(x)
+        
+        x = self.mid_layers(x,t)
         
         for i, l in enumerate(self.up_layers):
             if i>0:
@@ -100,7 +163,7 @@ def load_flower_dataset(data_dir='C:\\Users\\yzyja\\.cache\\kagglehub\\datasets\
     # Load datasets
     # Minimal transform: resize to same size and convert PIL to tensor (needed for DataLoader)
     minimal_transform = transforms.Compose([
-        transforms.Resize((256, 256)),  # Resize to same size for batching
+        transforms.Resize((image_size, image_size)),  # Use image_size parameter
         transforms.ToTensor()
     ])
     
@@ -177,79 +240,179 @@ def load_flower_dataset(data_dir='C:\\Users\\yzyja\\.cache\\kagglehub\\datasets\
     
     return result
 
-data = load_flower_dataset(create_dataloaders=True)
-train_load = data['train_loader']
-valid_load = data['valid_loader']
-cat_to_name = data['cat_to_name']
-images, labels = next(iter(train_load))
-num_samples = len(images)
-img = images[:5]
-# img = img.permute(0,2, 3, 1)
-# plt.imshow(img)
-
-def add_noise(x, alpha, noise):
+class noise_scheduler:
+    def __init__(self, T=1000, beta0=1e-4, betaT=0.02):
+        self.T = 1000
+        self.beta0 = beta0
+        self.betaT = betaT
+        self.betas = torch.linspace(1e-4, 0.02, T, device = device)
+        self.sqrt_betas = torch.sqrt(self.betas)
+        self.sqrt_one_minus_betas = torch.sqrt(1-self.betas)
+        
+        self.alphas = 1 - self.betas
+        self.alpha_cumprod = torch.cumprod(self.alphas, dim = 0)
+        self.sqrt_alpha_bar = torch.sqrt(self.alpha_cumprod)
+        self.sqrt_one_minus_alpha_bar = torch.sqrt(1-self.alpha_cumprod)
     
-    alpha = alpha.view(-1,1,1,1)
-    noisy = x*(1-alpha) + noise*alpha
-    return noisy
-
-
-
-net = UNet()
-net.to(device)
-n_epoch = 3
-loss_fn = nn.MSELoss()
-
-opt = torch.optim.Adam(net.parameters(), lr=1e-3)
-
-losses= []
-print('Training using gpu....')
-for epoch in tqdm.tqdm(range(n_epoch), desc='Training...'):
-    for idx, (x, y) in enumerate(train_load):
-        x = x.to(device)
-        alpha = torch.rand(x.shape[0]).to(device)
-        noise = torch.rand_like(x)
-        noisy_x = add_noise(x, alpha, noise)
-        
-        noise_pred = net(noisy_x)
-        
-        opt.zero_grad()
-        
-        loss = loss_fn(noise_pred, noise)
-        losses.append(loss)
-        loss.backward()
-        
-        opt.step()
-        
-        
-        print(f"Epoch:{epoch+1}, Iteration: {idx+1},  loss: {loss}")
-        
+    
         
 
-sample = torch.rand_like(x[0]).to(device).unsqueeze(0)
-residual = net(sample)
-sample = sample - residual
-plt.figure()
-img = sample[0].permute(1,2,0).detach().numpy()
-plt.imshow(img)
+    def add_noise(self, x, t, noise):
+        """Add noise to images based on alpha blending."""
+        sqrt_alpha_bar = self.sqrt_alpha_bar[t].to(x.device).view(-1, 1, 1, 1)
+        sqrt_one_minus_alpha_bar = self.sqrt_one_minus_alpha_bar[t].to(x.device).view(-1, 1, 1, 1)
+        noisy = x * sqrt_alpha_bar + noise * sqrt_one_minus_alpha_bar
+        return noisy
+
+    def denoise(self, x, residual, t):
+        eps = 1e-8
+        dev = x.device
+        sqrt_alpha_bar = self.sqrt_alpha_bar[t].to(dev).view(-1, 1, 1, 1)
+        sqrt_one_minus_alpha_bar = self.sqrt_one_minus_alpha_bar[t].to(dev).view(-1, 1, 1, 1)
+        beta_t = self.betas[t].to(dev).view(-1, 1, 1, 1)
+        sqrt_betas = self.sqrt_betas[t].to(dev).view(-1, 1, 1, 1)
+        alpha_t = self.alphas[t].to(dev).view(-1, 1, 1, 1)
+        sqrt_alpha_t = torch.sqrt(alpha_t)
+
+        clean = (x - residual * sqrt_one_minus_alpha_bar) / (sqrt_alpha_bar + eps)
+        prev_mu = (x - residual * beta_t / (sqrt_one_minus_alpha_bar + eps)) / (sqrt_alpha_t + eps)
+        # No noise on last step (t=0) for a deterministic final sample
+        prev_sigma = sqrt_betas * (t > 0).float().to(dev).view(-1, 1, 1, 1)
+        prev_sample = prev_mu + prev_sigma * torch.randn_like(prev_mu, device=dev)
+        return prev_sample, clean
 
 
-fig, ax = plt.subplots(2,1)
-grid = torchvision.utils.make_grid(img)
-grid = grid.detach().cpu().permute(1,2,0).numpy()
-ax[0].set_title('Input')
-ax[0].imshow(np.clip(grid, 0, 1))
+def train_diffusion_model(batch_size=8, n_epochs=3, image_size=256):
+    """Train the diffusion model with memory optimizations."""
+    # Load dataset with smaller batch size to avoid OOM
+    print("Loading dataset...")
+    data = load_flower_dataset(create_dataloaders=True, batch_size=batch_size, image_size=image_size)
+    train_load = data['train_loader']
+    valid_load = data['valid_loader']
+    cat_to_name = data['cat_to_name']
+    
+    
+    # Create model
+    print("Creating model...")
+    net = UNet()
+    net.to(device)
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in net.parameters())
+    trainable_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    print(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
+    
+    # Setup training
+    loss_fn = nn.MSELoss()
+    opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+    
+    losses = []
+    print(f'\nTraining using {device}....')
+    print(f'Batch size: {train_load.batch_size}')
+    print(f'Image size: {image_size}x{image_size}')
+    
+    noise_schedule = noise_scheduler()
+    
+    for epoch in tqdm.tqdm(range(n_epochs), desc='Training...'):
+        epoch_losses = []
+        net.train()
+        
+        for idx, (x, y) in enumerate(train_load):
+            # Move to device
+            x = x.to(device, non_blocking=True)
+            
+            # Create noise and alpha
+            t = torch.randint(0, 1000, (x.shape[0],), device=device)
+            noise = torch.randn_like(x, device = device)  # Use randn for better noise distribution
+            noisy_x = noise_schedule.add_noise(x, t, noise)
+            
+            # Forward pass
+            noise_pred = net(noisy_x,t)
+            
+            # Compute loss
+            opt.zero_grad()
+            loss = loss_fn(noise_pred, noise)
+            loss.backward()
+            
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+            
+            opt.step()
+            
+            # Store loss (move to CPU to save GPU memory)
+            loss_val = loss.item()
+            epoch_losses.append(loss_val)
+            
+            # Clear variables to free memory immediately
+            # del x, alpha, noise, noisy_x, noise_pred, loss
+            
+            # Clear cache periodically to prevent fragmentation
+            if (idx + 1) % 20 == 0:
+                torch.cuda.empty_cache()
+            
+            # Print progress less frequently
+            if (idx + 1) % 10 == 0:
+                if torch.cuda.is_available():
+                    mem_allocated = torch.cuda.memory_allocated() / 1e9
+                    mem_reserved = torch.cuda.memory_reserved() / 1e9
+                    print(f"Epoch:{epoch+1}, Iteration: {idx+1},  loss: {loss_val:.6f}, GPU Mem: {mem_allocated:.2f}GB/{mem_reserved:.2f}GB")
+                else:
+                    print(f"Epoch:{epoch+1}, Iteration: {idx+1},  loss: {loss_val:.6f}")
+        
+        # Store epoch average loss
+        avg_loss = np.mean(epoch_losses)
+        losses.append(avg_loss)
+        print(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.6f}")
+        
+        # Clear cache after each epoch
+        torch.cuda.empty_cache()
+    
+    return net, losses
 
-alpha = torch.linspace(0,1, img.shape[0])
-noise = torch.rand_like(img)
-x_noise = add_noise(img,alpha, noise)
-grid = torchvision.utils.make_grid(x_noise)
-grid = grid.detach().cpu().permute(1,2,0).numpy()
-ax[1].set_title('Noisy input')
-ax[1].imshow(np.clip(grid, 0, 1))
 
-plt.savefig('diffusion.png')
-
+if __name__ == "__main__":
+    # Clear any existing GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+    
+    # Train the model with memory-efficient settings
+    net, losses = train_diffusion_model(batch_size=64, n_epochs=10, image_size=256)
+    ns = noise_scheduler()
+    # Generate a sample image for visualization
+    print("\nGenerating sample...")
+    net.eval()
+    with torch.no_grad():
+        # Start from pure noise (x_T). Reverse steps: t=999 -> 998 -> ... -> 1 -> x_0.
+        # Do NOT run a step at t=0: the reverse step t=1->0 already gives x_0.
+        sample = torch.randn(1, 3, 256, 256).to(device)
+        generate = []
+        for t in tqdm.tqdm(range(999, 0, -1)):  # 999 down to 1 inclusive; last step (t=1) yields x_0
+            t_tensor = torch.tensor([t], device=device, dtype=torch.long)
+            residual = net(sample, t_tensor)
+            sample, clean = ns.denoise(sample, residual, t_tensor)
+            # Move to CPU for visualization (normalize to [0,1] for display)
+            sample_img = sample[0].squeeze().permute(1, 2, 0).detach().cpu().numpy()
+            smin, smax = sample_img.min(), sample_img.max()
+            sample_img = (sample_img - smin) / (smax - smin + 1e-8) if smax > smin else sample_img
+            if t % 100 == 0:
+                generate.append(sample_img)
+        # Final sample is x_0; add it for the timeline (loop ended at t=1)
+        final_img = sample[0].squeeze().permute(1, 2, 0).detach().cpu().numpy()
+        fmin, fmax = final_img.min(), final_img.max()
+        final_img = (final_img - fmin) / (fmax - fmin + 1e-8) if fmax > fmin else final_img
+        generate.append(final_img)
+    plt.figure()
+    clean_np = clean.squeeze().permute(1, 2, 0).detach().cpu().numpy()  # estimated x_0 from last step
+    cmin, cmax = clean_np.min(), clean_np.max()
+    clean_np = (clean_np - cmin) / (cmax - cmin + 1e-8) if cmax > cmin else clean_np
+    plt.imshow(np.clip(clean_np, 0, 1))
+    fig, ax = plt.subplots(1,10, figsize = (12,5))
+    for idx, img in enumerate(generate):
+        ax[idx].imshow(img)
+    plt.show()
+        
+        
 
 
 # Visualize samples from training dataloader
@@ -322,4 +485,3 @@ def visualize_samples(dataloader, cat_to_name, num_samples=8, figsize=(12, 12)):
 # Visualize samples
 # print("Visualizing samples from training dataloader...")
 # visualize_samples(train_load, cat_to_name, num_samples=8)
-
